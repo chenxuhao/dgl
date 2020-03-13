@@ -34,6 +34,7 @@ cusparseStatus_t Xcsrmm2<float>(cusparseHandle_t handle, cusparseOperation_t tra
     const float* alpha, const cusparseMatDescr_t descrA,
     const float* csrValA, const int* csrRowPtrA, const int* csrColIndA,
     const float* B, int ldb, const float* beta, float* C, int ldc) {
+  //printf("cusparseScsrmm2: m=%d, n=%d, k=%d, nnz=%d\n", m, n, k, nnz);
   return cusparseScsrmm2(handle, transA, transB, m, n, k, nnz,
       alpha, descrA, csrValA, csrRowPtrA, csrColIndA,
       B, ldb, beta, C, ldc);
@@ -126,6 +127,7 @@ void CusparseCsrmm2(
       static_cast<int32_t*>(csr.indices->data),
       B_data, n, &beta, trans_out, m));
   device->FreeWorkspace(rtcfg.ctx, valptr);
+  cudaDeviceSynchronize();
   // transpose the output matrix
   if (!thr_entry->cublas_handle) {
     CUBLAS_CALL(cublasCreate(&(thr_entry->cublas_handle)));
@@ -140,6 +142,7 @@ void CusparseCsrmm2(
       &beta, nullptr, n,
       C_data, n));
   device->FreeWorkspace(rtcfg.ctx, trans_out);
+  cudaDeviceSynchronize();
 }
 
 // forward

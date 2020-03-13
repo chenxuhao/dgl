@@ -56,6 +56,7 @@ def evaluate(model, features, labels, mask):
         return correct.item() * 1.0 / len(labels)
 
 def main(args):
+    torch.set_num_threads(args.nt)
     # load and preprocess dataset
     data = load_data(args)
     features = torch.FloatTensor(data.features)
@@ -70,14 +71,17 @@ def main(args):
         test_mask = torch.ByteTensor(data.test_mask)
     in_feats = features.shape[1]
     n_classes = data.num_labels
+    n_nodes = data.graph.number_of_nodes()
     n_edges = data.graph.number_of_edges()
     print("""----Data statistics------'
+      #Nthreads %d
+      #Nodes %d
       #Edges %d
       #Classes %d
       #Train samples %d
       #Val samples %d
       #Test samples %d""" %
-          (n_edges, n_classes,
+          (args.nt, n_nodes, n_edges, n_classes,
            train_mask.int().sum().item(),
            val_mask.int().sum().item(),
            test_mask.int().sum().item()))
@@ -96,10 +100,12 @@ def main(args):
 
     # graph preprocess and calculate normalization factor
     g = data.graph
-    g.remove_edges_from(nx.selfloop_edges(g))
+    if not args.dataset == 'reddit':
+        g.remove_edges_from(nx.selfloop_edges(g))
     g = DGLGraph(g)
     n_edges = g.number_of_edges()
 
+    print("create GraphSAGE model")
     # create GraphSAGE model
     model = GraphSAGE(g,
                       in_feats,
@@ -115,9 +121,11 @@ def main(args):
         model.cuda()
     loss_fcn = torch.nn.CrossEntropyLoss()
 
+    print("use optimizer")
     # use optimizer
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
+    print("initialize graph")
     # initialize graph
     dur = []
     for epoch in range(args.n_epochs):
@@ -164,6 +172,7 @@ if __name__ == '__main__':
                         help="Weight for L2 loss")
     parser.add_argument("--aggregator-type", type=str, default="gcn",
                         help="Aggregator type: mean/gcn/pool/lstm")
+    parser.add_argument("--nt", type=int, default=1, help="num_threads")
     args = parser.parse_args()
     print(args)
 

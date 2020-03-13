@@ -36,6 +36,7 @@ def evaluate(model, features, labels, mask):
 
 
 def main(args):
+    torch.set_num_threads(args.nt)
     # load and preprocess dataset
     data = load_data(args)
     features = torch.FloatTensor(data.features)
@@ -50,14 +51,17 @@ def main(args):
         test_mask = torch.ByteTensor(data.test_mask)
     num_feats = features.shape[1]
     n_classes = data.num_labels
+    n_nodes = data.graph.number_of_nodes()
     n_edges = data.graph.number_of_edges()
     print("""----Data statistics------'
+      #Nthreads %d
+      #Nodes %d
       #Edges %d
       #Classes %d 
       #Train samples %d
       #Val samples %d
       #Test samples %d""" %
-          (n_edges, n_classes,
+          (args.nt, n_nodes, n_edges, n_classes,
            train_mask.int().sum().item(),
            val_mask.int().sum().item(),
            test_mask.int().sum().item()))
@@ -75,9 +79,11 @@ def main(args):
 
     g = data.graph
     # add self loop
-    g.remove_edges_from(nx.selfloop_edges(g))
+    if not args.dataset == 'reddit':
+        g.remove_edges_from(nx.selfloop_edges(g))
     g = DGLGraph(g)
-    g.add_edges(g.nodes(), g.nodes())
+    if not args.dataset == 'reddit':
+        g.add_edges(g.nodes(), g.nodes())
     n_edges = g.number_of_edges()
     # create model
     heads = ([args.num_heads] * args.num_layers) + [args.num_out_heads]
@@ -174,6 +180,7 @@ if __name__ == '__main__':
                         help="indicates whether to use early stop or not")
     parser.add_argument('--fastmode', action="store_true", default=False,
                         help="skip re-evaluate the validation set")
+    parser.add_argument("--nt", type=int, default=1, help="num_threads")
     args = parser.parse_args()
     print(args)
 

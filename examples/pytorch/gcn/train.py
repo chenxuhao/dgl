@@ -22,6 +22,7 @@ def evaluate(model, features, labels, mask):
         return correct.item() * 1.0 / len(labels)
 
 def main(args):
+    torch.set_num_threads(args.nt)
     # load and preprocess dataset
     data = load_data(args)
     features = torch.FloatTensor(data.features)
@@ -36,14 +37,20 @@ def main(args):
         test_mask = torch.ByteTensor(data.test_mask)
     in_feats = features.shape[1]
     n_classes = data.num_labels
+    n_nodes = data.graph.number_of_nodes()
     n_edges = data.graph.number_of_edges()
+    print("[debug] features size: ", features.shape)
+    #print("[debug] features[0]: ", features[0])
     print("""----Data statistics------'
+      #Nthreads %d
+      #Nodes %d
       #Edges %d
+      #Features %d
       #Classes %d
       #Train samples %d
       #Val samples %d
       #Test samples %d""" %
-          (n_edges, n_classes,
+          (args.nt, n_nodes, n_edges, in_feats, n_classes,
               train_mask.int().sum().item(),
               val_mask.int().sum().item(),
               test_mask.int().sum().item()))
@@ -97,8 +104,8 @@ def main(args):
     dur = []
     for epoch in range(args.n_epochs):
         model.train()
-        if epoch >= 3:
-            t0 = time.time()
+        #if epoch >= 1:
+        t0 = time.time()
         # forward
         logits = model(features)
         loss = loss_fcn(logits[train_mask], labels[train_mask])
@@ -106,17 +113,19 @@ def main(args):
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
+        t1 = time.time()
 
-        if epoch >= 3:
-            dur.append(time.time() - t0)
-
-        acc = evaluate(model, features, labels, val_mask)
+        #if epoch >= 1:
+        runtime = t1 - t0
+        dur.append(runtime)
+        avg_time = np.mean(dur)
+        acc = 0#evaluate(model, features, labels, val_mask)
         print("Epoch {:05d} | Time(s) {:.4f} | Loss {:.4f} | Accuracy {:.4f} | "
-              "ETputs(KTEPS) {:.2f}". format(epoch, np.mean(dur), loss.item(),
-                                             acc, n_edges / np.mean(dur) / 1000))
+              "ETputs(KTEPS) {:.2f}". format(epoch, runtime, loss.item(),
+                                             acc, n_edges / avg_time / 1000))
 
     print()
-    acc = evaluate(model, features, labels, test_mask)
+    acc = 0#evaluate(model, features, labels, test_mask)
     print("Test accuracy {:.2%}".format(acc))
 
 
@@ -139,6 +148,7 @@ if __name__ == '__main__':
             help="Weight for L2 loss")
     parser.add_argument("--self-loop", action='store_true',
             help="graph self-loop (default=False)")
+    parser.add_argument("--nt", type=int, default=1, help="num_threads")
     parser.set_defaults(self_loop=False)
     args = parser.parse_args()
     print(args)
