@@ -1,8 +1,13 @@
-# This is a simple MXNet server demo shows how to use DGL distributed kvstore.
-import dgl
+import os
 import argparse
-import torch as th
 import time
+
+import dgl
+from dgl.contrib import KVClient
+
+import torch as th
+
+partition = th.tensor([0,0,1,1,2,2,3,3])
 
 ID = []
 ID.append(th.tensor([0,1]))
@@ -10,35 +15,68 @@ ID.append(th.tensor([2,3]))
 ID.append(th.tensor([4,5]))
 ID.append(th.tensor([6,7]))
 
-edata_partition_book = {'edata':th.tensor([0,0,1,1,2,2,3,3])}
-ndata_partition_book = {'ndata':th.tensor([0,0,1,1,2,2,3,3])}
+DATA = []
+DATA.append(th.tensor([[1.,1.,1.,],[1.,1.,1.,]]))
+DATA.append(th.tensor([[2.,2.,2.,],[2.,2.,2.,]]))
+DATA.append(th.tensor([[3.,3.,3.,],[3.,3.,3.,]]))
+DATA.append(th.tensor([[4.,4.,4.,],[4.,4.,4.,]]))
 
-def start_client():
-    time.sleep(3)
 
-    client = dgl.contrib.start_client(ip_config='ip_config.txt', 
-                                      ndata_partition_book=ndata_partition_book, 
-                                      edata_partition_book=edata_partition_book)
+class ArgParser(argparse.ArgumentParser):
+    def __init__(self):
+        super(ArgParser, self).__init__()
 
-    client.push(name='edata', id_tensor=ID[client.get_id()], data_tensor=th.tensor([[1.,1.,1.],[1.,1.,1.]]))
-    client.push(name='ndata', id_tensor=ID[client.get_id()], data_tensor=th.tensor([[2.,2.,2.],[2.,2.,2.]]))
+        self.add_argument('--ip_config', type=str, default='ip_config.txt',
+                          help='IP configuration file of kvstore.')
+        self.add_argument('--num_worker', type=int, default=2,
+                          help='Number of worker (client nodes) on single-machine.')
 
-    client.barrier()
 
-    tensor_edata = client.pull(name='edata', id_tensor=th.tensor([0,1,2,3,4,5,6,7]))
-    tensor_ndata = client.pull(name='ndata', id_tensor=th.tensor([0,1,2,3,4,5,6,7]))
+def start_client(args):
+    """Start client
+    """
+    server_namebook = dgl.contrib.read_ip_config(filename=args.ip_config)
 
-    print(tensor_edata)
+    my_client = KVClient(server_namebook=server_namebook)
 
-    client.barrier()
+    my_client.connect()
 
-    print(tensor_ndata)
+    if my_client.get_id() % args.num_worker == 0:
+        my_client.set_partition_book(name='entity_embed', partition_book=partition)
+    else:
+        my_client.set_partition_book(name='entity_embed')
 
-    client.barrier()
+    my_client.print()
 
-    if client.get_id() == 0:
-        client.shut_down()
+    my_client.barrier()
+
+    print("send request...")
+
+    for i in range(100):
+        for i in range(4):
+            my_client.push(name='entity_embed', id_tensor=ID[i], data_tensor=DATA[i])
+
+    my_client.barrier()
+
+    if my_client.get_id() % args.num_worker == 0:
+        res = my_client.pull(name='entity_embed', id_tensor=th.tensor([0,1,2,3,4,5,6,7]))
+        print(res)
+
+    my_client.barrier()
+
+    for i in range(100):
+        my_client.push(name='entity_embed', id_tensor=ID[my_client.get_machine_id()], data_tensor=th.tensor([[0.,0.,0.],[0.,0.,0.]]))
+
+    my_client.barrier()
+
+    if my_client.get_id() % args.num_worker == 0:
+        res = my_client.pull(name='entity_embed', id_tensor=th.tensor([0,1,2,3,4,5,6,7]))
+        print(res)
+
+    if my_client.get_id() == 0:
+        my_client.shut_down()
+
 
 if __name__ == '__main__':
-
-    start_client()
+    args = ArgParser().parse_args()
+    start_client(args)
