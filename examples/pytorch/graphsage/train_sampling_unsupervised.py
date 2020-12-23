@@ -13,67 +13,37 @@ import argparse
 from _thread import start_new_thread
 from functools import wraps
 from dgl.data import RedditDataset
+from torch.nn.parallel import DistributedDataParallel
 import tqdm
 import traceback
 import sklearn.linear_model as lm
 import sklearn.metrics as skm
 
-#### Negative sampler
+from utils import thread_wrapped_func
 
 class NegativeSampler(object):
-    def __init__(self, g):
+    def __init__(self, g, k, neg_share=False):
         self.weights = g.in_degrees().float() ** 0.75
+        self.k = k
+        self.neg_share = neg_share
 
-    def __call__(self, num_samples):
-        return self.weights.multinomial(num_samples, replacement=True)
+    def __call__(self, g, eids):
+        src, _ = g.find_edges(eids)
+        n = len(src)
+        if self.neg_share and n % self.k == 0:
+            dst = self.weights.multinomial(n, replacement=True)
+            dst = dst.view(-1, 1, self.k).expand(-1, self.k, -1).flatten()
+        else:
+            dst = self.weights.multinomial(n*self.k, replacement=True)
+        src = src.repeat_interleave(self.k)
+        return src, dst
 
-#### Neighbor sampler
-
-class NeighborSampler(object):
-    def __init__(self, g, fanouts, num_negs):
-        self.g = g
-        self.fanouts = fanouts
-        self.neg_sampler = NegativeSampler(g)
-        self.num_negs = num_negs
-
-    def sample_blocks(self, seed_edges):
-        n_edges = len(seed_edges)
-        seed_edges = th.LongTensor(np.asarray(seed_edges))
-        heads, tails = self.g.find_edges(seed_edges)
-        neg_tails = self.neg_sampler(self.num_negs * n_edges)
-        neg_heads = heads.view(-1, 1).expand(n_edges, self.num_negs).flatten()
-
-        # Maintain the correspondence between heads, tails and negative tails as two
-        # graphs.
-        # pos_graph contains the correspondence between each head and its positive tail.
-        # neg_graph contains the correspondence between each head and its negative tails.
-        # Both pos_graph and neg_graph are first constructed with the same node space as
-        # the original graph.  Then they are compacted together with dgl.compact_graphs.
-        pos_graph = dgl.graph((heads, tails), num_nodes=self.g.number_of_nodes())
-        neg_graph = dgl.graph((neg_heads, neg_tails), num_nodes=self.g.number_of_nodes())
-        pos_graph, neg_graph = dgl.compact_graphs([pos_graph, neg_graph])
-
-        # Obtain the node IDs being used in either pos_graph or neg_graph.  Since they
-        # are compacted together, pos_graph and neg_graph share the same compacted node
-        # space.
-        seeds = pos_graph.ndata[dgl.NID]
-        blocks = []
-        for fanout in self.fanouts:
-            # For each seed node, sample ``fanout`` neighbors.
-            frontier = dgl.sampling.sample_neighbors(g, seeds, fanout, replace=True)
-            # Remove all edges between heads and tails, as well as heads and neg_tails.
-            _, _, edge_ids = frontier.edge_ids(
-                th.cat([heads, tails, neg_heads, neg_tails]),
-                th.cat([tails, heads, neg_tails, neg_heads]),
-                return_uv=True)
-            frontier = dgl.remove_edges(frontier, edge_ids)
-            # Then we compact the frontier into a bipartite graph for message passing.
-            block = dgl.to_block(frontier, seeds)
-            # Obtain the seed nodes for next layer.
-            seeds = block.srcdata[dgl.NID]
-
-            blocks.insert(0, block)
-        return pos_graph, neg_graph, blocks
+def load_subtensor(g, input_nodes, device):
+    """
+    Copys features and labels of a set of nodes onto GPU.
+    """
+    batch_inputs = g.ndata['features'][input_nodes].to(device)
+    return batch_inputs
 
 class SAGE(nn.Module):
     def __init__(self,
@@ -98,14 +68,7 @@ class SAGE(nn.Module):
     def forward(self, blocks, x):
         h = x
         for l, (layer, block) in enumerate(zip(self.layers, blocks)):
-            # We need to first copy the representation of nodes on the RHS from the
-            # appropriate nodes on the LHS.
-            # Note that the shape of h is (num_nodes_LHS, D) and the shape of h_dst
-            # would be (num_nodes_RHS, D)
-            h_dst = h[:block.number_of_dst_nodes()]
-            # Then we compute the updated representation on the RHS.
-            # The shape of h now becomes (num_nodes_RHS, D)
-            h = layer(block, (h, h_dst))
+            h = layer(block, h)
             if l != len(self.layers) - 1:
                 h = self.activation(h)
                 h = self.dropout(h)
@@ -129,20 +92,26 @@ class SAGE(nn.Module):
         for l, layer in enumerate(self.layers):
             y = th.zeros(g.number_of_nodes(), self.n_hidden if l != len(self.layers) - 1 else self.n_classes)
 
-            for start in tqdm.trange(0, len(nodes), batch_size):
-                end = start + batch_size
-                batch_nodes = nodes[start:end]
-                block = dgl.to_block(dgl.in_subgraph(g, batch_nodes), batch_nodes)
-                input_nodes = block.srcdata[dgl.NID]
+            sampler = dgl.dataloading.MultiLayerFullNeighborSampler(1)
+            dataloader = dgl.dataloading.NodeDataLoader(
+                g,
+                th.arange(g.number_of_nodes()),
+                sampler,
+                batch_size=args.batch_size,
+                shuffle=True,
+                drop_last=False,
+                num_workers=args.num_workers)
+
+            for input_nodes, output_nodes, blocks in tqdm.tqdm(dataloader):
+                block = blocks[0].to(device)
 
                 h = x[input_nodes].to(device)
-                h_dst = h[:block.number_of_dst_nodes()]
-                h = layer(block, (h, h_dst))
+                h = layer(block, h)
                 if l != len(self.layers) - 1:
                     h = self.activation(h)
                     h = self.dropout(h)
 
-                y[start:end] = h.cpu()
+                y[output_nodes] = h.cpu()
 
             x = y
         return y
@@ -163,40 +132,27 @@ class CrossEntropyLoss(nn.Module):
         loss = F.binary_cross_entropy_with_logits(score, label.float())
         return loss
 
-def prepare_mp(g):
-    """
-    Explicitly materialize the CSR, CSC and COO representation of the given graph
-    so that they could be shared via copy-on-write to sampler workers and GPU
-    trainers.
-
-    This is a workaround before full shared memory support on heterogeneous graphs.
-    """
-    g.in_degree(0)
-    g.out_degree(0)
-    g.find_edges([0])
-
 def compute_acc(emb, labels, train_nids, val_nids, test_nids):
     """
     Compute the accuracy of prediction given the labels.
     """
     emb = emb.cpu().numpy()
+    labels = labels.cpu().numpy()
     train_nids = train_nids.cpu().numpy()
-    train_labels = labels[train_nids].cpu().numpy()
+    train_labels = labels[train_nids]
     val_nids = val_nids.cpu().numpy()
-    val_labels = labels[val_nids].cpu().numpy()
+    val_labels = labels[val_nids]
     test_nids = test_nids.cpu().numpy()
-    test_labels = labels[test_nids].cpu().numpy()
+    test_labels = labels[test_nids]
 
     emb = (emb - emb.mean(0, keepdims=True)) / emb.std(0, keepdims=True)
 
     lr = lm.LogisticRegression(multi_class='multinomial', max_iter=10000)
-    lr.fit(emb[train_nids], labels[train_nids])
+    lr.fit(emb[train_nids], train_labels)
 
     pred = lr.predict(emb)
-    f1_micro_eval = skm.f1_score(labels[val_nids], pred[val_nids], average='micro')
-    f1_micro_test = skm.f1_score(labels[test_nids], pred[test_nids], average='micro')
-    f1_macro_eval = skm.f1_score(labels[val_nids], pred[val_nids], average='macro')
-    f1_macro_test = skm.f1_score(labels[test_nids], pred[test_nids], average='macro')
+    f1_micro_eval = skm.f1_score(val_labels, pred[val_nids], average='micro')
+    f1_micro_test = skm.f1_score(test_labels, pred[test_nids], average='micro')
     return f1_micro_eval, f1_micro_test
 
 def evaluate(model, g, inputs, labels, train_nids, val_nids, test_nids, batch_size, device):
@@ -211,48 +167,78 @@ def evaluate(model, g, inputs, labels, train_nids, val_nids, test_nids, batch_si
     """
     model.eval()
     with th.no_grad():
-        pred = model.inference(g, inputs, batch_size, device)
+        # single gpu
+        if isinstance(model, SAGE):
+            pred = model.inference(g, inputs, batch_size, device)
+        # multi gpu
+        else:
+            pred = model.module.inference(g, inputs, batch_size, device)
     model.train()
     return compute_acc(pred, labels, train_nids, val_nids, test_nids)
 
-def load_subtensor(g, seeds, input_nodes, device):
-    """
-    Copys features and labels of a set of nodes onto GPU.
-    """
-    batch_inputs = g.ndata['features'][input_nodes].to(device)
-    return batch_inputs
-
 #### Entry point
-def run(args, device, data):
+def run(proc_id, n_gpus, args, devices, data):
     # Unpack data
+    device = devices[proc_id]
+    if n_gpus > 1:
+        dist_init_method = 'tcp://{master_ip}:{master_port}'.format(
+            master_ip='127.0.0.1', master_port='12345')
+        world_size = n_gpus
+        th.distributed.init_process_group(backend="nccl",
+                                          init_method=dist_init_method,
+                                          world_size=world_size,
+                                          rank=proc_id)
     train_mask, val_mask, test_mask, in_feats, labels, n_classes, g = data
 
-    train_nid = th.LongTensor(np.nonzero(train_mask)[0])
-    val_nid = th.LongTensor(np.nonzero(val_mask)[0])
-    test_nid = th.LongTensor(np.nonzero(test_mask)[0])
+    train_nid = th.LongTensor(np.nonzero(train_mask)).squeeze()
+    val_nid = th.LongTensor(np.nonzero(val_mask)).squeeze()
+    test_nid = th.LongTensor(np.nonzero(test_mask)).squeeze()
 
-    # Create sampler
-    sampler = NeighborSampler(g, [int(fanout) for fanout in args.fan_out.split(',')], args.num_negs)
+    #train_nid = th.LongTensor(np.nonzero(train_mask)[0])
+    #val_nid = th.LongTensor(np.nonzero(val_mask)[0])
+    #test_nid = th.LongTensor(np.nonzero(test_mask)[0])
 
     # Create PyTorch DataLoader for constructing blocks
-    dataloader = DataLoader(
-        dataset=np.arange(g.number_of_edges()),
+    n_edges = g.number_of_edges()
+    train_seeds = np.arange(n_edges)
+    if n_gpus > 0:
+        num_per_gpu = (train_seeds.shape[0] + n_gpus -1) // n_gpus
+        train_seeds = train_seeds[proc_id * num_per_gpu :
+                                  (proc_id + 1) * num_per_gpu \
+                                  if (proc_id + 1) * num_per_gpu < train_seeds.shape[0]
+                                  else train_seeds.shape[0]]
+
+    # Create sampler
+    sampler = dgl.dataloading.MultiLayerNeighborSampler(
+        [int(fanout) for fanout in args.fan_out.split(',')])
+    dataloader = dgl.dataloading.EdgeDataLoader(
+        g, train_seeds, sampler, exclude='reverse_id',
+        # For each edge with ID e in Reddit dataset, the reverse edge is e ± |E|/2.
+        reverse_eids=th.cat([
+            th.arange(n_edges // 2, n_edges),
+            th.arange(0, n_edges // 2)]),
+        negative_sampler=NegativeSampler(g, args.num_negs),
         batch_size=args.batch_size,
-        collate_fn=sampler.sample_blocks,
         shuffle=True,
         drop_last=False,
+        pin_memory=True,
         num_workers=args.num_workers)
 
     # Define model and optimizer
     model = SAGE(in_feats, args.num_hidden, args.num_hidden, args.num_layers, F.relu, args.dropout)
     model = model.to(device)
+    if n_gpus > 1:
+        model = DistributedDataParallel(model, device_ids=[device], output_device=device)
     loss_fcn = CrossEntropyLoss()
     loss_fcn = loss_fcn.to(device)
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
 
     # Training loop
     avg = 0
-    iter_tput = []
+    iter_pos = []
+    iter_neg = []
+    iter_d = []
+    iter_t = []
     best_eval_acc = 0
     best_test_acc = 0
     for epoch in range(args.num_epochs):
@@ -260,17 +246,15 @@ def run(args, device, data):
 
         # Loop over the dataloader to sample the computation dependency graph as a list of
         # blocks.
-        for step, (pos_graph, neg_graph, blocks) in enumerate(dataloader):
-            tic_step = time.time()
 
-            # The nodes for input lies at the LHS side of the first block.
-            # The nodes for output lies at the RHS side of the last block.
-            input_nodes = blocks[0].srcdata[dgl.NID]
-            seeds = blocks[-1].dstdata[dgl.NID]
+        tic_step = time.time()
+        for step, (input_nodes, pos_graph, neg_graph, blocks) in enumerate(dataloader):
+            batch_inputs = load_subtensor(g, input_nodes, device)
+            d_step = time.time()
 
-            # Load the input features as well as output labels
-            batch_inputs = load_subtensor(g, seeds, input_nodes, device)
-
+            pos_graph = pos_graph.to(device)
+            neg_graph = neg_graph.to(device)
+            blocks = [block.int().to(device) for block in blocks]
             # Compute loss and prediction
             batch_pred = model(blocks, batch_inputs)
             loss = loss_fcn(batch_pred, pos_graph, neg_graph)
@@ -278,30 +262,75 @@ def run(args, device, data):
             loss.backward()
             optimizer.step()
 
-            iter_tput.append(len(seeds) / (time.time() - tic_step))
+            t = time.time()
+            pos_edges = pos_graph.number_of_edges()
+            neg_edges = neg_graph.number_of_edges()
+            iter_pos.append(pos_edges / (t - tic_step))
+            iter_neg.append(neg_edges / (t - tic_step))
+            iter_d.append(d_step - tic_step)
+            iter_t.append(t - d_step)
             if step % args.log_every == 0:
                 gpu_mem_alloc = th.cuda.max_memory_allocated() / 1000000 if th.cuda.is_available() else 0
-                print('Epoch {:05d} | Step {:05d} | Loss {:.4f} | Speed (samples/sec) {:.4f} | GPU {:.1f} MiB'.format(
-                    epoch, step, loss.item(), np.mean(iter_tput[3:]), gpu_mem_alloc))
+                print('[{}]Epoch {:05d} | Step {:05d} | Loss {:.4f} | Speed (samples/sec) {:.4f}|{:.4f} | Load {:.4f}| train {:.4f} | GPU {:.1f} MB'.format(
+                    proc_id, epoch, step, loss.item(), np.mean(iter_pos[3:]), np.mean(iter_neg[3:]), np.mean(iter_d[3:]), np.mean(iter_t[3:]), gpu_mem_alloc))
+            tic_step = time.time()
 
-            if step % args.eval_every == 0:
+            if step % args.eval_every == 0 and proc_id == 0:
                 eval_acc, test_acc = evaluate(model, g, g.ndata['features'], labels, train_nid, val_nid, test_nid, args.batch_size, device)
                 print('Eval Acc {:.4f} Test Acc {:.4f}'.format(eval_acc, test_acc))
                 if eval_acc > best_eval_acc:
                     best_eval_acc = eval_acc
                     best_test_acc = test_acc
                 print('Best Eval Acc {:.4f} Test Acc {:.4f}'.format(best_eval_acc, best_test_acc))
-
+        if n_gpus > 1:
+            th.distributed.barrier()
     print('Avg epoch time: {}'.format(avg / (epoch - 4)))
+
+def main(args, devices):
+    # load reddit data
+    data = RedditDataset(self_loop=False)
+    n_classes = data.num_classes
+    g = data[0]
+    features = g.ndata['feat']
+    in_feats = features.shape[1]
+    labels = g.ndata['label']
+    train_mask = g.ndata['train_mask']
+    val_mask = g.ndata['val_mask']
+    test_mask = g.ndata['test_mask']
+    g.ndata['features'] = features
+
+    # Create csr/coo/csc formats before launching training processes with multi-gpu.
+    # This avoids creating certain formats in each sub-process, which saves momory and CPU.
+    g.create_formats_()
+    # Pack data
+    data = train_mask, val_mask, test_mask, in_feats, labels, n_classes, g
+
+    n_gpus = len(devices)
+    if devices[0] == -1:
+        run(0, 0, args, ['cpu'], data)
+    elif n_gpus == 1:
+        run(0, n_gpus, args, devices, data)
+    else:
+        procs = []
+        for proc_id in range(n_gpus):
+            p = mp.Process(target=thread_wrapped_func(run),
+                           args=(proc_id, n_gpus, args, devices, data))
+            p.start()
+            procs.append(p)
+        for p in procs:
+            p.join()
+
 
 if __name__ == '__main__':
     argparser = argparse.ArgumentParser("multi-gpu training")
-    argparser.add_argument('--gpu', type=int, default=0,
-        help="GPU device ID. Use -1 for CPU training")
+    argparser.add_argument("--gpu", type=str, default='0',
+            help="GPU, can be a list of gpus for multi-gpu trianing, e.g., 0,1,2,3; -1 for CPU")
     argparser.add_argument('--num-epochs', type=int, default=20)
     argparser.add_argument('--num-hidden', type=int, default=16)
     argparser.add_argument('--num-layers', type=int, default=2)
     argparser.add_argument('--num-negs', type=int, default=1)
+    argparser.add_argument('--neg-share', default=False, action='store_true',
+        help="sharing neg nodes for positive nodes")
     argparser.add_argument('--fan-out', type=str, default='10,25')
     argparser.add_argument('--batch-size', type=int, default=10000)
     argparser.add_argument('--log-every', type=int, default=20)
@@ -311,26 +340,7 @@ if __name__ == '__main__':
     argparser.add_argument('--num-workers', type=int, default=0,
         help="Number of sampling processes. Use 0 for no extra process.")
     args = argparser.parse_args()
-    
-    if args.gpu >= 0:
-        device = th.device('cuda:%d' % args.gpu)
-    else:
-        device = th.device('cpu')
 
-    # load reddit data
-    data = RedditDataset(self_loop=True)
-    train_mask = data.train_mask
-    val_mask = data.val_mask
-    test_mask = data.test_mask
-    features = th.Tensor(data.features)
-    in_feats = features.shape[1]
-    labels = th.LongTensor(data.labels)
-    n_classes = data.num_labels
-    # Construct graph
-    g = dgl.graph(data.graph.all_edges())
-    g.ndata['features'] = features
-    prepare_mp(g)
-    # Pack data
-    data = train_mask, val_mask, test_mask, in_feats, labels, n_classes, g
+    devices = list(map(int, args.gpu.split(',')))
 
-    run(args, device, data)
+    main(args, devices)

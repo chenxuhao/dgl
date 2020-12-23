@@ -30,6 +30,7 @@ def unpack_lib(name, libs) {
 def build_dgl_linux(dev) {
   init_git()
   sh "bash tests/scripts/build_dgl.sh ${dev}"
+  sh "ls -lh /usr/lib/x86_64-linux-gnu/"
   pack_lib("dgl-${dev}-linux", dgl_linux_libs)
 }
 
@@ -56,7 +57,7 @@ def cpp_unit_test_win64() {
 def unit_test_linux(backend, dev) {
   init_git()
   unpack_lib("dgl-${dev}-linux", dgl_linux_libs)
-  timeout(time: 10, unit: 'MINUTES') {
+  timeout(time: 15, unit: 'MINUTES') {
     sh "bash tests/scripts/task_unit_test.sh ${backend} ${dev}"
   }
 }
@@ -64,7 +65,7 @@ def unit_test_linux(backend, dev) {
 def unit_test_win64(backend, dev) {
   init_git_win64()
   unpack_lib("dgl-${dev}-win64", dgl_win64_libs)
-  timeout(time: 2, unit: 'MINUTES') {
+  timeout(time: 10, unit: 'MINUTES') {
     bat "CALL tests\\scripts\\task_unit_test.bat ${backend}"
   }
 }
@@ -101,7 +102,8 @@ pipeline {
       agent { 
         docker {
           label "linux-c52x-node"
-          image "dgllib/dgl-ci-lint" 
+          image "dgllib/dgl-ci-lint"  
+          alwaysPull true
         }
       }
       steps {
@@ -121,6 +123,7 @@ pipeline {
             docker {
               label "linux-c52x-node"
               image "dgllib/dgl-ci-cpu:conda" 
+              alwaysPull true
             }
           }
           steps {
@@ -138,6 +141,7 @@ pipeline {
               label "linux-c52x-node"
               image "dgllib/dgl-ci-gpu:conda"
               args "-u root"
+              alwaysPull true
             }
           }
           steps {
@@ -173,6 +177,7 @@ pipeline {
             docker { 
               label "linux-c52x-node"
               image "dgllib/dgl-ci-cpu:conda"
+              alwaysPull true
             }
           }
           steps {
@@ -200,6 +205,7 @@ pipeline {
             docker {
               label "linux-c52x-node"
               image "dgllib/dgl-ci-cpu:conda" 
+              alwaysPull true
             }
           }
           stages {
@@ -221,6 +227,7 @@ pipeline {
               label "linux-gpu-node"
               image "dgllib/dgl-ci-gpu:conda" 
               args "--runtime nvidia"
+              alwaysPull true
             }
           }
           stages {
@@ -241,6 +248,7 @@ pipeline {
             docker {
               label "linux-c52x-node"
               image "dgllib/dgl-ci-cpu:conda" 
+              alwaysPull true
             }
           }
           stages {
@@ -292,6 +300,7 @@ pipeline {
               label "linux-gpu-node"
               image "dgllib/dgl-ci-gpu:conda"
               args "--runtime nvidia"
+              alwaysPull true
             }
           }
           stages {
@@ -318,6 +327,7 @@ pipeline {
             docker {
               label "linux-c52x-node"
               image "dgllib/dgl-ci-cpu:conda" 
+              alwaysPull true
             }
           }
           stages {
@@ -344,6 +354,7 @@ pipeline {
               label "linux-gpu-node" 
               image "dgllib/dgl-ci-gpu:conda"
               args "--runtime nvidia"
+              alwaysPull true
             }
           }
           stages {

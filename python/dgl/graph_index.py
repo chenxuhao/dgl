@@ -50,7 +50,16 @@ class GraphIndex(ObjectBase):
         """The pickle state of GraphIndex is defined as a triplet
         (number_of_nodes, readonly, src_nodes, dst_nodes)
         """
-        num_nodes, readonly, src, dst = state
+        # Pickle compatibility check
+        # TODO: we should store a storage version number in later releases.
+        if isinstance(state, tuple) and len(state) == 5:
+            dgl_warning("The object is pickled pre-0.4.2.  Multigraph flag is ignored in 0.4.3")
+            num_nodes, _, readonly, src, dst = state
+        elif isinstance(state, tuple) and len(state) == 4:
+            # post-0.4.3.
+            num_nodes, readonly, src, dst = state
+        else:
+            raise IOError('Unrecognized storage format.')
 
         self._cache = {}
         self._readonly = readonly
@@ -557,8 +566,7 @@ class GraphIndex(ObjectBase):
         v_array = v.todgltensor()
         subg = _CAPI_DGLGetSubgraphWithHalo(self, v_array, num_hops)
         inner_nodes = _CAPI_GetHaloSubgraphInnerNodes(subg)
-        inner_edges = _CAPI_GetHaloSubgraphInnerEdges(subg)
-        return subg, inner_nodes, inner_edges
+        return subg, inner_nodes
 
     def node_subgraphs(self, vs_arr):
         """Return the induced node subgraphs.
@@ -1162,9 +1170,6 @@ def from_edge_list(elist, readonly):
     src_ids = utils.toindex(src)
     dst_ids = utils.toindex(dst)
     num_nodes = max(src.max(), dst.max()) + 1
-    min_nodes = min(src.min(), dst.min())
-    if min_nodes != 0:
-        raise DGLError('Invalid edge list. Nodes must start from 0.')
     return from_coo(num_nodes, src_ids, dst_ids, readonly)
 
 def map_to_subgraph_nid(induced_nodes, parent_nids):
@@ -1290,8 +1295,5 @@ def create_graph_index(graph_data, readonly):
 
 def _get_halo_subgraph_inner_node(halo_subg):
     return _CAPI_GetHaloSubgraphInnerNodes(halo_subg)
-
-def _get_halo_subgraph_inner_edge(halo_subg):
-    return _CAPI_GetHaloSubgraphInnerEdges(halo_subg)
 
 _init_api("dgl.graph_index")

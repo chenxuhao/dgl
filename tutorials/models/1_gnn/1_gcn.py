@@ -49,7 +49,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from dgl import DGLGraph
 
-gcn_msg = fn.copy_src(src='h', out='m')
+gcn_msg = fn.copy_u(u='h', out='m')
 gcn_reduce = fn.sum(msg='m', out='h')
 
 ###############################################################################
@@ -95,15 +95,14 @@ print(net)
 ###############################################################################
 # We load the cora dataset using DGL's built-in data module.
 
-from dgl.data import citation_graph as citegrh
-import networkx as nx
+from dgl.data import CoraGraphDataset
 def load_cora_data():
-    data = citegrh.load_cora()
-    features = th.FloatTensor(data.features)
-    labels = th.LongTensor(data.labels)
-    train_mask = th.BoolTensor(data.train_mask)
-    test_mask = th.BoolTensor(data.test_mask)
-    g = DGLGraph(data.graph)
+    dataset = CoraGraphDataset()
+    g = dataset[0]
+    features = g.ndata['feat']
+    labels = g.ndata['label']
+    train_mask = g.ndata['train_mask']
+    test_mask = g.ndata['test_mask']
     return g, features, labels, train_mask, test_mask
 
 ###############################################################################
@@ -126,6 +125,8 @@ def evaluate(model, g, features, labels, mask):
 import time
 import numpy as np
 g, features, labels, train_mask, test_mask = load_cora_data()
+# Add edges between each node and itself to preserve old node representations
+g.add_edges(g.nodes(), g.nodes())
 optimizer = th.optim.Adam(net.parameters(), lr=1e-2)
 dur = []
 for epoch in range(50):
@@ -159,18 +160,23 @@ for epoch in range(50):
 # 
 # Here, :math:`H^{(l)}` denotes the :math:`l^{th}` layer in the network,
 # :math:`\sigma` is the non-linearity, and :math:`W` is the weight matrix for
-# this layer. :math:`D` and :math:`A`, as commonly seen, represent degree
-# matrix and adjacency matrix, respectively. The ~ is a renormalization trick
-# in which we add a self-connection to each node of the graph, and build the
-# corresponding degree and adjacency matrix.  The shape of the input
+# this layer. :math:`\tilde{D}` and :math:`\tilde{A}` are separately the degree
+# and adjacency matrices for the graph. With the superscript ~, we are referring
+# to the variant where we add additional edges between each node and itself to
+# preserve its old representation in graph convolutions. The shape of the input
 # :math:`H^{(0)}` is :math:`N \times D`, where :math:`N` is the number of nodes
 # and :math:`D` is the number of input features. We can chain up multiple
 # layers as such to produce a node-level representation output with shape
-# :math`N \times F`, where :math:`F` is the dimension of the output node
+# :math:`N \times F`, where :math:`F` is the dimension of the output node
 # feature vector.
-# 
+#
 # The equation can be efficiently implemented using sparse matrix
 # multiplication kernels (such as Kipf's
 # `pygcn <https://github.com/tkipf/pygcn>`_ code). The above DGL implementation
 # in fact has already used this trick due to the use of builtin functions. To
 # understand what is under the hood, please read our tutorial on :doc:`PageRank <../../basics/3_pagerank>`.
+#
+# Note that the tutorial code implements a simplified version of GCN where we
+# replace :math:`\tilde{D}^{-\frac{1}{2}}\tilde{A}\tilde{D}^{-\frac{1}{2}}` with
+# :math:`\tilde{A}`. For a full implementation, see our example
+# `here  <https://github.com/dmlc/dgl/tree/master/examples/pytorch/gcn>`_.
