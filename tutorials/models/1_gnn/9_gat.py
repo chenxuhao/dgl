@@ -1,13 +1,20 @@
 """
 .. _model-gat:
 
-Graph attention network
-==================================
+Understand Graph Attention Network
+=======================================
 
 **Authors:** `Hao Zhang <https://github.com/sufeidechabei/>`_, `Mufei Li
 <https://github.com/mufeili>`_, `Minjie Wang
 <https://jermainewang.github.io/>`_  `Zheng Zhang
 <https://shanghai.nyu.edu/academics/faculty/directory/zheng-zhang>`_
+
+.. warning::
+
+    The tutorial aims at gaining insights into the paper, with code as a mean
+    of explanation. The implementation thus is NOT optimized for running
+    efficiency. For recommended implementation, please refer to the `official
+    examples <https://github.com/dmlc/dgl/tree/master/examples>`_.
 
 In this tutorial, you learn about a graph attention network (GAT) and how it can be 
 implemented in PyTorch. You can also learn to visualize and understand what the attention 
@@ -94,9 +101,24 @@ structure-free normalization, in the style of attention.
 # GAT in DGL
 # ----------
 #
+# DGL provides an off-the-shelf implementation of the GAT layer under the ``dgl.nn.<backend>``
+# subpackage. Simply import the ``GATConv`` as the follows.
+
+from dgl.nn.pytorch import GATConv
+
+###############################################################
+# Readers can skip the following step-by-step explanation of the implementation and
+# jump to the `Put everything together`_ for training and visualization results.
+#
 # To begin, you can get an overall impression about how a ``GATLayer`` module is
 # implemented in DGL. In this section, the four equations above are broken down 
 # one at a time.
+#
+# .. note::
+#
+#    This is showing how to implement a GAT from scratch.  DGL provides a more
+#    efficient :class:`builtin GAT layer module <dgl.nn.pytorch.conv.GATConv>`.
+#
 
 import torch
 import torch.nn as nn
@@ -111,6 +133,13 @@ class GATLayer(nn.Module):
         self.fc = nn.Linear(in_dim, out_dim, bias=False)
         # equation (2)
         self.attn_fc = nn.Linear(2 * out_dim, 1, bias=False)
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        """Reinitialize learnable parameters."""
+        gain = nn.init.calculate_gain('relu')
+        nn.init.xavier_normal_(self.fc.weight, gain=gain)
+        nn.init.xavier_normal_(self.attn_fc.weight, gain=gain)
 
     def edge_attention(self, edges):
         # edge UDF for equation (2)
@@ -277,11 +306,7 @@ def load_cora_data():
     features = torch.FloatTensor(data.features)
     labels = torch.LongTensor(data.labels)
     mask = torch.BoolTensor(data.train_mask)
-    g = data.graph
-    # add self loop
-    g.remove_edges_from(nx.selfloop_edges(g))
-    g = DGLGraph(g)
-    g.add_edges(g.nodes(), g.nodes())
+    g = DGLGraph(data.graph)
     return g, features, labels, mask
 
 ##############################################################################

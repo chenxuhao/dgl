@@ -110,12 +110,11 @@ def prepare_data(dataset, prog_args, train=False, pre_process=None):
         pre_process(dataset, prog_args)
 
     # dataset.set_fold(fold)
-    return torch.utils.data.DataLoader(dataset,
-                                       batch_size=prog_args.batch_size,
-                                       shuffle=shuffle,
-                                       collate_fn=collate_fn,
-                                       drop_last=True,
-                                       num_workers=prog_args.n_worker)
+    return dgl.dataloading.GraphDataLoader(dataset,
+                                           batch_size=prog_args.batch_size,
+                                           shuffle=shuffle,
+                                           drop_last=True,
+                                           num_workers=prog_args.n_worker)
 
 
 def graph_classify_task(prog_args):
@@ -191,26 +190,6 @@ def graph_classify_task(prog_args):
     print("test  accuracy {}%".format(result * 100))
 
 
-def collate_fn(batch):
-    '''
-    collate_fn for dataset batching
-    transform ndata to tensor (in gpu is available)
-    '''
-    graphs, labels = map(list, zip(*batch))
-    #cuda = torch.cuda.is_available()
-
-    # batch graphs and cast to PyTorch tensor
-    for graph in graphs:
-        for (key, value) in graph.ndata.items():
-            graph.ndata[key] = torch.FloatTensor(value)
-    batched_graphs = dgl.batch(graphs)
-
-    # cast to PyTorch tensor
-    batched_labels = torch.LongTensor(np.array(labels))
-
-    return batched_graphs, batched_labels
-
-
 def train(dataset, model, prog_args, same_feat=True, val_dataset=None):
     '''
     training function
@@ -233,9 +212,11 @@ def train(dataset, model, prog_args, same_feat=True, val_dataset=None):
         print("EPOCH ###### {} ######".format(epoch))
         computation_time = 0.0
         for (batch_idx, (batch_graph, graph_labels)) in enumerate(dataloader):
+            for (key, value) in batch_graph.ndata.items():
+                batch_graph.ndata[key] = value.float()
+            graph_labels = graph_labels.long()
             if torch.cuda.is_available():
-                for (key, value) in batch_graph.ndata.items():
-                    batch_graph.ndata[key] = value.cuda()
+                batch_graph = batch_graph.to(torch.cuda.current_device())
                 graph_labels = graph_labels.cuda()
 
             model.zero_grad()
@@ -284,9 +265,11 @@ def evaluate(dataloader, model, prog_args, logger=None):
     correct_label = 0
     with torch.no_grad():
         for batch_idx, (batch_graph, graph_labels) in enumerate(dataloader):
+            for (key, value) in batch_graph.ndata.items():
+                batch_graph.ndata[key] = value.float()
+            graph_labels = graph_labels.long()
             if torch.cuda.is_available():
-                for (key, value) in batch_graph.ndata.items():
-                    batch_graph.ndata[key] = value.cuda()
+                batch_graph = batch_graph.to(torch.cuda.current_device())
                 graph_labels = graph_labels.cuda()
             ypred = model(batch_graph)
             indi = torch.argmax(ypred, dim=1)
